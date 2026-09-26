@@ -2,3 +2,4 @@ main.go
 go.mod
 go.sum
 task1loi/testtask_test.go
+main_test.go
