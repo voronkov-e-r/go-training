@@ -1,0 +1,210 @@
+package hardnet
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type Book struct {
+	ID     int    `json:"id"`
+	Title  string `json:"title"`
+	Author string `json:"author"`
+	Year   int    `json:"year"`
+}
+
+type Store struct {
+	mu     sync.RWMutex
+	books  map[int]Book
+	nextID atomic.Int64
+}
+
+type Server struct {
+	store *Store
+}
+
+func (s *Server) handleGetBooks(w http.ResponseWriter, r *http.Request) {
+	id, _ := r.Context().Value(requestIDKey).(string)
+	log.Printf("[%s] GET /books", id)
+	s.store.mu.RLock()
+	books := make([]Book, 0, len(s.store.books))
+	for _, b := range s.store.books {
+		books = append(books, b)
+	}
+	s.store.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(books)
+}
+
+func (s *Server) handleGetBook(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+
+	if err != nil {
+		http.Error(w, "Incorrect id", http.StatusBadRequest)
+		return
+	}
+
+	s.store.mu.RLock()
+
+	val, ok := s.store.books[id]
+	s.store.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Book not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(val)
+}
+
+func (s *Server) handleCreateBook(w http.ResponseWriter, r *http.Request) {
+	var book Book
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(&book); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if book.Title == "" || book.Author == "" {
+		http.Error(w, "Incorrect input", http.StatusBadRequest)
+		return
+	}
+
+	id := int(s.store.nextID.Add(1))
+	book.ID = id
+	s.store.mu.Lock()
+	s.store.books[id] = book
+	s.store.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Location", fmt.Sprintf("/books/%d", id))
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(book)
+}
+
+func (s *Server) handleUpdateBook(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var patch map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	s.store.mu.Lock()
+
+	book, ok := s.store.books[id]
+	if !ok {
+		s.store.mu.Unlock()
+		http.Error(w, "book not found", http.StatusNotFound)
+		return
+	}
+
+	if v, ok := patch["title"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			s.store.mu.Unlock()
+			http.Error(w, "title must be string", http.StatusBadRequest)
+			return
+		}
+		if str == "" {
+			s.store.mu.Unlock()
+			http.Error(w, "title cannot be empty", http.StatusBadRequest)
+			return
+		}
+		book.Title = str
+	}
+	if v, ok := patch["author"]; ok {
+		str, ok := v.(string)
+		if !ok {
+			s.store.mu.Unlock()
+			http.Error(w, "author must be string", http.StatusBadRequest)
+			return
+		}
+		book.Author = str
+	}
+	if v, ok := patch["year"]; ok {
+		num, ok := v.(float64)
+		if !ok {
+			s.store.mu.Unlock()
+			http.Error(w, "year must be number", http.StatusBadRequest)
+			return
+		}
+		book.Year = int(num)
+	}
+
+	s.store.books[id] = book
+	s.store.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(book)
+}
+
+func (s *Server) handleDeleteBook(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.Atoi(idStr)
+
+	if err != nil {
+		http.Error(w, "Incorrect id", http.StatusBadRequest)
+		return
+	}
+
+	s.store.mu.Lock()
+	_, ok := s.store.books[id]
+	if ok {
+		delete(s.store.books, id)
+	}
+	s.store.mu.Unlock()
+
+	if !ok {
+		http.Error(w, "book not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func Chain(h http.Handler, mws ...Middleware) http.Handler {
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
+}
+
+func main() {
+	store := &Store{books: make(map[int]Book)}
+	srv := &Server{store: store}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /books", srv.handleGetBooks)
+	mux.HandleFunc("GET /books/{id}", srv.handleGetBook)
+	mux.HandleFunc("POST /books", srv.handleCreateBook)
+	mux.HandleFunc("PUT /books/{id}", srv.handleUpdateBook)
+	mux.HandleFunc("DELETE /books/{id}", srv.handleDeleteBook)
+	mux.HandleFunc("GET /panic", func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})
+
+	handle := Chain(mux, Logging, Recovery, RequestID)
+
+	httpSrv := &http.Server{
+		Addr:         ":8080",
+		Handler:      handle,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	log.Fatal(httpSrv.ListenAndServe())
+}
