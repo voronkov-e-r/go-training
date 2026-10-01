@@ -15,11 +15,42 @@ import (
 	"time"
 )
 
+type Status string
+
+const (
+	StatusAvailable Status = "available"
+	StatusBorrowed  Status = "borrowed"
+	StatusLost      Status = "lost"
+)
+
+func (st *Status) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err != nil {
+		return err
+	}
+
+	switch Status(str) {
+	case StatusAvailable, StatusBorrowed, StatusLost:
+		*st = Status(str)
+		return nil
+	default:
+		return fmt.Errorf("unknown status: %q", str)
+	}
+}
+
 type Book struct {
-	ID     int    `json:"id"`
-	Title  string `json:"title"`
-	Author string `json:"author"`
-	Year   int    `json:"year"`
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	Author    string    `json:"author"`
+	Year      int       `json:"year"`
+	Status    Status    `json:"status,omitempty"`
+	Tags      []string  `json:"tags,omitempty"`
+	Publisher Publisher `json:"publisher"`
+}
+
+type Publisher struct {
+	Name    string `json:"name"`
+	Country string `json:"country,omitempty"`
 }
 
 type Store struct {
@@ -71,7 +102,9 @@ func (s *Server) handleGetBook(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateBook(w http.ResponseWriter, r *http.Request) {
 	var book Book
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	if err := json.NewDecoder(r.Body).Decode(&book); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&book); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -79,6 +112,10 @@ func (s *Server) handleCreateBook(w http.ResponseWriter, r *http.Request) {
 	if book.Title == "" || book.Author == "" {
 		http.Error(w, "Incorrect input", http.StatusBadRequest)
 		return
+	}
+
+	if book.Status == "" {
+		book.Status = StatusAvailable
 	}
 
 	id := int(s.store.nextID.Add(1))
@@ -101,14 +138,21 @@ func (s *Server) handleUpdateBook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var patch map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+	dec := json.NewDecoder(r.Body)
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	p, err := parseBookPatch(m)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	s.store.mu.Lock()
-
 	book, ok := s.store.books[id]
 	if !ok {
 		s.store.mu.Unlock()
@@ -116,37 +160,23 @@ func (s *Server) handleUpdateBook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if v, ok := patch["title"]; ok {
-		str, ok := v.(string)
-		if !ok {
-			s.store.mu.Unlock()
-			http.Error(w, "title must be string", http.StatusBadRequest)
-			return
-		}
-		if str == "" {
-			s.store.mu.Unlock()
-			http.Error(w, "title cannot be empty", http.StatusBadRequest)
-			return
-		}
-		book.Title = str
+	if p.Title != nil {
+		book.Title = *p.Title
 	}
-	if v, ok := patch["author"]; ok {
-		str, ok := v.(string)
-		if !ok {
-			s.store.mu.Unlock()
-			http.Error(w, "author must be string", http.StatusBadRequest)
-			return
-		}
-		book.Author = str
+	if p.Author != nil {
+		book.Author = *p.Author
 	}
-	if v, ok := patch["year"]; ok {
-		num, ok := v.(float64)
-		if !ok {
-			s.store.mu.Unlock()
-			http.Error(w, "year must be number", http.StatusBadRequest)
-			return
-		}
-		book.Year = int(num)
+	if p.Year != nil {
+		book.Year = *p.Year
+	}
+	if p.Status != nil {
+		book.Status = *p.Status
+	}
+	if p.Tags != nil {
+		book.Tags = p.Tags
+	}
+	if p.Publisher != nil {
+		book.Publisher = *p.Publisher
 	}
 
 	s.store.books[id] = book
@@ -201,8 +231,12 @@ func main() {
 		panic("boom")
 	})
 	mux.HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Second)
-		fmt.Fprintln(w, "Done")
+		select {
+		case <-time.After(5 * time.Second):
+			fmt.Fprintln(w, "done")
+		case <-r.Context().Done():
+			log.Println("client disconnected")
+		}
 	})
 
 	handle := Chain(mux, Logging, Recovery, RequestID)
