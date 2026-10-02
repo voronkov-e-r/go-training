@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -65,7 +65,7 @@ type Server struct {
 
 func (s *Server) handleGetBooks(w http.ResponseWriter, r *http.Request) {
 	id, _ := r.Context().Value(requestIDKey).(string)
-	log.Printf("[%s] GET /books", id)
+	slog.Info("get books", "id", id)
 	s.store.mu.RLock()
 	books := make([]Book, 0, len(s.store.books))
 	for _, b := range s.store.books {
@@ -220,6 +220,12 @@ func main() {
 	store := &Store{books: make(map[int]Book)}
 	srv := &Server{store: store}
 
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, opts))
+	slog.SetDefault(logger)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /books", srv.handleGetBooks)
@@ -235,7 +241,7 @@ func main() {
 		case <-time.After(5 * time.Second):
 			fmt.Fprintln(w, "done")
 		case <-r.Context().Done():
-			log.Println("client disconnected")
+			slog.Info("client disconnected", "path", "/slow")
 		}
 	})
 
@@ -250,22 +256,22 @@ func main() {
 	}
 
 	go func() {
-		log.Println("server starting on :8080")
+		slog.Info("server starting", "port", "8080")
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v\n", err)
+			slog.Error("server error", "error", err)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("shutting down...")
+	slog.Info("shutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if er := httpSrv.Shutdown(ctx); er != nil {
-		log.Fatalf("forced shutdown: %v", er)
+		slog.Error("forced shutdown", "error", er)
 	}
-	log.Println("server stopped")
+	slog.Info("server stopped")
 }

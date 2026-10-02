@@ -2,7 +2,7 @@ package hardnet
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -33,7 +33,11 @@ func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if er := recover(); er != nil {
-				log.Printf("PANIC: %v\n%s", er, debug.Stack())
+				slog.Error("PANIC recovered",
+					"panic", er,
+					"stack", string(debug.Stack()),
+					"path", r.URL.Path,
+				)
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 			}
 		}()
@@ -72,6 +76,14 @@ func Logging(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		log.Printf("%s %s %d %v %s", r.Method, r.URL.Path, status, time.Since(start), r.RemoteAddr)
+		id := rec.Header().Get("X-Request-ID")
+		slog.Info("request",
+			"requestID", id,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"duration", time.Since(start).Microseconds(),
+			"remoteIP", r.RemoteAddr,
+		)
 	})
 }
